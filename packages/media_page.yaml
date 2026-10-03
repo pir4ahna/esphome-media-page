@@ -95,10 +95,10 @@ online_image:
           src: mp_cover
       - lambda: 'lv_obj_invalidate(id(mp_cover_img));'
     on_error:
+      - lambda: 'id(mp_last_key) = "";'
       - logger.log:
           level: WARN
           format: "media_page: cover download failed"
-
 # -----------------------------------------------------------------------------
 # State
 # -----------------------------------------------------------------------------
@@ -118,7 +118,9 @@ globals:
   - id: mp_last_url
     type: std::string
     initial_value: '""'
-
+  - id: mp_last_key
+    type: std::string
+    initial_value: '""'
 # -----------------------------------------------------------------------------
 # Home Assistant data (all internal: nothing is exposed back to HA)
 # -----------------------------------------------------------------------------
@@ -166,25 +168,22 @@ text_sensor:
             return x;
 
   - platform: homeassistant
+    id: mp_picture_local_src
+    entity_id: ${mp_entity}
+    attribute: entity_picture_local
+    internal: true
+    on_value:
+      - script.execute: mp_update_cover
+
+  # Fallback: used ONLY if it is a local path (starts with "/"),
+  # remote URLs (e.g. Music Assistant) are never fetched directly.
+  - platform: homeassistant
     id: mp_picture_src
     entity_id: ${mp_entity}
     attribute: entity_picture
     internal: true
     on_value:
-      - if:
-          condition:
-            lambda: |-
-              if (x.empty() || x == "unknown" || x == "unavailable" || x == "None") return false;
-              std::string url = (x.rfind("http", 0) == 0) ? x : std::string("${mp_ha_url}") + x;
-              if (url == id(mp_last_url)) return false;
-              id(mp_last_url) = url;
-              return true;
-          then:
-            - online_image.set_url:
-                id: mp_cover
-                url: !lambda 'return id(mp_last_url);'
-            - component.update: mp_cover
-
+      - script.execute: mp_update_cover
 sensor:
   - platform: homeassistant
     id: mp_position_src
@@ -248,6 +247,38 @@ script:
           fmt((int) dur, b2, sizeof(b2));
           lv_label_set_text(id(mp_time_cur), b1);
           lv_label_set_text(id(mp_time_total), b2);
+
+  - id: mp_update_cover
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: |-
+              auto valid = [](const std::string &s) {
+                return !s.empty() && s != "unknown" && s != "unavailable" && s != "None";
+              };
+              std::string path;
+              if (id(mp_picture_local_src).has_state() && valid(id(mp_picture_local_src).state)) {
+                path = id(mp_picture_local_src).state;
+              } else if (id(mp_picture_src).has_state() && valid(id(mp_picture_src).state) &&
+                         id(mp_picture_src).state[0] == '/') {
+                path = id(mp_picture_src).state;
+              }
+              if (path.empty()) return false;
+
+              std::string url = (path.rfind("http", 0) == 0) ? path : std::string("${mp_ha_url}") + path;
+              // Dedupe by image hash ("cache=..."), the token part may change
+              size_t c = url.find("cache=");
+              std::string key = (c != std::string::npos) ? url.substr(c) : url;
+              if (key == id(mp_last_key)) return false;
+              id(mp_last_key) = key;
+              id(mp_last_url) = url;
+              return true;
+          then:
+            - online_image.set_url:
+                id: mp_cover
+                url: !lambda 'return id(mp_last_url);'
+            - component.update: mp_cover
 
 interval:
   - interval: 1s
