@@ -1,0 +1,488 @@
+# =============================================================================
+# esphome-media-page: media player page for ESPHome + LVGL (480x320 landscape)
+# Requires: lvgl, homeassistant API with "allow device to perform actions".
+# All user specific values come from substitutions (see README).
+# =============================================================================
+
+substitutions:
+  # --- Required: override in YOUR config ---
+  mp_entity: media_player.example
+  mp_ha_url: "http://homeassistant.local:8123"   # no trailing slash
+
+  # --- Optional ---
+  mp_page_id: media_page
+  mp_back_page: main_page
+  mp_art_format: JPEG                            # JPEG or PNG (must match what your player serves)
+  mp_text_idle: "Nothing playing"                # do not use double quotes here
+  mp_verify_ssl: "true"
+  mp_icon_font_file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/v7.4.47/fonts/materialdesignicons-webfont.ttf"
+
+  # --- Colors ---
+  mp_bg: "0x121212"
+  mp_card: "0x1E1E1E"
+  mp_card_pressed: "0x2E2E2E"
+  mp_accent: "0xF8CC6D"
+  mp_accent_pressed: "0xD9B35A"
+  mp_text: "0xFFFFFF"
+  mp_text_dim: "0x9AA0A6"
+  mp_on_accent: "0x121212"
+
+# -----------------------------------------------------------------------------
+# Network / fonts
+# -----------------------------------------------------------------------------
+http_request:
+  verify_ssl: ${mp_verify_ssl}
+  timeout: 10s
+
+font:
+  # Icons (Material Design Icons). Codepoints: https://pictogrammers.com/library/mdi/
+  - file: ${mp_icon_font_file}
+    id: mp_icons_m
+    size: 32
+    bpp: 4
+    glyphs:
+      - "\U000F04AE"   # skip-previous
+      - "\U000F04AD"   # skip-next
+      - "\U000F0141"   # chevron-left
+      - "\U000F057F"   # volume-low
+  - file: ${mp_icon_font_file}
+    id: mp_icons_l
+    size: 44
+    bpp: 4
+    glyphs:
+      - "\U000F040A"   # play
+      - "\U000F03E4"   # pause
+
+  # Text (Latin + Cyrillic)
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 700
+    id: mp_font_title
+    size: 24
+    bpp: 4
+    glyphsets: [GF_Latin_Core, GF_Cyrillic_Core]
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 400
+    id: mp_font_body
+    size: 18
+    bpp: 4
+    glyphsets: [GF_Latin_Core, GF_Cyrillic_Core]
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 400
+    id: mp_font_small
+    size: 14
+    bpp: 4
+    glyphsets: [GF_Latin_Core, GF_Cyrillic_Core]
+
+# -----------------------------------------------------------------------------
+# Cover art
+# -----------------------------------------------------------------------------
+online_image:
+  - id: mp_cover
+    url: "https://example.invalid/cover.jpg"   # placeholder, real URL is set at runtime
+    type: RGB565
+    format: ${mp_art_format}
+    resize: 200x200
+    update_interval: never
+    on_download_finished:
+      - lvgl.image.update:
+          id: mp_cover_img
+          src: mp_cover
+      - lambda: 'lv_obj_invalidate(id(mp_cover_img));'
+    on_error:
+      - logger.log:
+          level: WARN
+          format: "media_page: cover download failed"
+
+# -----------------------------------------------------------------------------
+# State
+# -----------------------------------------------------------------------------
+globals:
+  - id: mp_pos
+    type: float
+    initial_value: "0"
+  - id: mp_dur
+    type: float
+    initial_value: "0"
+  - id: mp_anchor_ms
+    type: uint32_t
+    initial_value: "0"
+  - id: mp_playing
+    type: bool
+    initial_value: "false"
+  - id: mp_last_url
+    type: std::string
+    initial_value: '""'
+
+# -----------------------------------------------------------------------------
+# Home Assistant data (all internal: nothing is exposed back to HA)
+# -----------------------------------------------------------------------------
+text_sensor:
+  - platform: homeassistant
+    id: mp_state
+    entity_id: ${mp_entity}
+    internal: true
+    on_value:
+      - lambda: |-
+          bool now_playing = (x == "playing");
+          if (id(mp_playing) && !now_playing) {
+            id(mp_pos) += (millis() - id(mp_anchor_ms)) / 1000.0f;
+          }
+          id(mp_anchor_ms) = millis();
+          id(mp_playing) = now_playing;
+      - lvgl.label.update:
+          id: mp_play_lbl
+          text: !lambda |-
+            return x == "playing" ? std::string("\U000F03E4") : std::string("\U000F040A");
+      - script.execute: mp_refresh_progress
+
+  - platform: homeassistant
+    id: mp_title_src
+    entity_id: ${mp_entity}
+    attribute: media_title
+    internal: true
+    on_value:
+      - lvgl.label.update:
+          id: mp_title
+          text: !lambda |-
+            if (x.empty() || x == "unknown" || x == "None") return std::string("${mp_text_idle}");
+            return x;
+
+  - platform: homeassistant
+    id: mp_artist_src
+    entity_id: ${mp_entity}
+    attribute: media_artist
+    internal: true
+    on_value:
+      - lvgl.label.update:
+          id: mp_artist
+          text: !lambda |-
+            if (x == "unknown" || x == "None") return std::string("");
+            return x;
+
+  - platform: homeassistant
+    id: mp_picture_src
+    entity_id: ${mp_entity}
+    attribute: entity_picture
+    internal: true
+    on_value:
+      - if:
+          condition:
+            lambda: |-
+              if (x.empty() || x == "unknown" || x == "unavailable" || x == "None") return false;
+              std::string url = (x.rfind("http", 0) == 0) ? x : std::string("${mp_ha_url}") + x;
+              if (url == id(mp_last_url)) return false;
+              id(mp_last_url) = url;
+              return true;
+          then:
+            - online_image.set_url:
+                id: mp_cover
+                url: !lambda 'return id(mp_last_url);'
+            - component.update: mp_cover
+
+sensor:
+  - platform: homeassistant
+    id: mp_position_src
+    entity_id: ${mp_entity}
+    attribute: media_position
+    internal: true
+    on_value:
+      - lambda: |-
+          id(mp_pos) = std::isnan(x) ? 0.0f : x;
+          id(mp_anchor_ms) = millis();
+      - script.execute: mp_refresh_progress
+
+  - platform: homeassistant
+    id: mp_duration_src
+    entity_id: ${mp_entity}
+    attribute: media_duration
+    internal: true
+    on_value:
+      - lambda: 'id(mp_dur) = std::isnan(x) ? 0.0f : x;'
+      - script.execute: mp_refresh_progress
+
+  - platform: homeassistant
+    id: mp_volume_src
+    entity_id: ${mp_entity}
+    attribute: volume_level
+    internal: true
+    on_value:
+      - lambda: |-
+          if (std::isnan(x)) return;
+          if (lv_obj_has_state(id(mp_volume_slider), LV_STATE_PRESSED)) return;  // don't fight the finger
+          int v = (int) roundf(x * 100.0f);
+          lv_slider_set_value(id(mp_volume_slider), v, LV_ANIM_OFF);
+          lv_label_set_text_fmt(id(mp_volume_lbl), "%d%%", v);
+
+# -----------------------------------------------------------------------------
+# Progress bar + time (position is interpolated locally between HA updates)
+# -----------------------------------------------------------------------------
+script:
+  - id: mp_refresh_progress
+    mode: restart
+    then:
+      - lambda: |-
+          auto fmt = [](int s, char *b, size_t n) {
+            if (s >= 3600) snprintf(b, n, "%d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60);
+            else snprintf(b, n, "%d:%02d", s / 60, s % 60);
+          };
+          float dur = id(mp_dur);
+          float pos = id(mp_pos);
+          if (id(mp_playing)) pos += (millis() - id(mp_anchor_ms)) / 1000.0f;
+          if (dur <= 0.0f) {
+            lv_bar_set_value(id(mp_progress), 0, LV_ANIM_OFF);
+            lv_label_set_text(id(mp_time_cur), "");
+            lv_label_set_text(id(mp_time_total), "");
+            return;
+          }
+          if (pos < 0.0f) pos = 0.0f;
+          if (pos > dur) pos = dur;
+          lv_bar_set_value(id(mp_progress), (int) (pos / dur * 1000.0f), LV_ANIM_OFF);
+          char b1[16], b2[16];
+          fmt((int) pos, b1, sizeof(b1));
+          fmt((int) dur, b2, sizeof(b2));
+          lv_label_set_text(id(mp_time_cur), b1);
+          lv_label_set_text(id(mp_time_total), b2);
+
+interval:
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            lvgl.page.is_showing: ${mp_page_id}
+          then:
+            - script.execute: mp_refresh_progress
+
+# -----------------------------------------------------------------------------
+# UI
+# NOTE: every label sets text_font explicitly, because the host project's LVGL
+# theme may define a global label font (e.g. a huge icon font).
+# -----------------------------------------------------------------------------
+lvgl:
+  style_definitions:
+    - id: mp_style_btn
+      radius: CIRCLE
+      bg_color: ${mp_card}
+      bg_opa: COVER
+      border_width: 0
+      shadow_width: 0
+      pad_all: 0
+
+  pages:
+    - id: ${mp_page_id}
+      bg_color: ${mp_bg}
+      on_load:
+        - script.execute: mp_refresh_progress
+      widgets:
+        # ---- Cover ----
+        - obj:
+            id: mp_cover_box
+            x: 16
+            y: 16
+            width: 200
+            height: 200
+            radius: 16
+            clip_corner: true
+            bg_color: ${mp_card}
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            scrollable: false
+            widgets:
+              - image:
+                  id: mp_cover_img
+                  align: CENTER
+                  src: mp_cover
+
+        # ---- Title / artist ----
+        - label:
+            id: mp_title
+            x: 232
+            y: 18
+            width: 232
+            long_mode: SCROLL_CIRCULAR
+            text: "${mp_text_idle}"
+            text_font: mp_font_title
+            text_color: ${mp_text}
+        - label:
+            id: mp_artist
+            x: 232
+            y: 54
+            width: 232
+            long_mode: DOT
+            text: ""
+            text_font: mp_font_body
+            text_color: ${mp_text_dim}
+
+        # ---- Progress ----
+        - bar:
+            id: mp_progress
+            x: 232
+            y: 100
+            width: 232
+            height: 6
+            min_value: 0
+            max_value: 1000
+            value: 0
+            radius: 3
+            bg_color: ${mp_card_pressed}
+            bg_opa: COVER
+            indicator:
+              bg_color: ${mp_accent}
+              radius: 3
+        - label:
+            id: mp_time_cur
+            x: 232
+            y: 112
+            text: ""
+            text_font: mp_font_small
+            text_color: ${mp_text_dim}
+        - label:
+            id: mp_time_total
+            x: 232
+            y: 112
+            width: 232
+            text_align: RIGHT
+            text: ""
+            text_font: mp_font_small
+            text_color: ${mp_text_dim}
+
+        # ---- Transport ----
+        - button:
+            id: mp_prev_btn
+            x: 232
+            y: 148
+            width: 60
+            height: 60
+            styles: mp_style_btn
+            pressed:
+              bg_color: ${mp_card_pressed}
+            on_click:
+              - homeassistant.action:
+                  action: media_player.media_previous_track
+                  data:
+                    entity_id: ${mp_entity}
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "\U000F04AE"
+                  text_font: mp_icons_m
+                  text_color: ${mp_text}
+
+        - button:
+            id: mp_play_btn
+            x: 310
+            y: 140
+            width: 76
+            height: 76
+            styles: mp_style_btn
+            bg_color: ${mp_accent}
+            pressed:
+              bg_color: ${mp_accent_pressed}
+            on_click:
+              - homeassistant.action:
+                  action: media_player.media_play_pause
+                  data:
+                    entity_id: ${mp_entity}
+            widgets:
+              - label:
+                  id: mp_play_lbl
+                  align: CENTER
+                  text: "\U000F040A"
+                  text_font: mp_icons_l
+                  text_color: ${mp_on_accent}
+
+        - button:
+            id: mp_next_btn
+            x: 404
+            y: 148
+            width: 60
+            height: 60
+            styles: mp_style_btn
+            pressed:
+              bg_color: ${mp_card_pressed}
+            on_click:
+              - homeassistant.action:
+                  action: media_player.media_next_track
+                  data:
+                    entity_id: ${mp_entity}
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "\U000F04AD"
+                  text_font: mp_icons_m
+                  text_color: ${mp_text}
+
+        # ---- Bottom row: back + volume ----
+        - button:
+            id: mp_back_btn
+            x: 16
+            y: 240
+            width: 56
+            height: 56
+            styles: mp_style_btn
+            pressed:
+              bg_color: ${mp_card_pressed}
+            on_click:
+              - lvgl.page.show:
+                  id: ${mp_back_page}
+                  animation: NONE
+                  time: 250ms
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "\U000F0141"
+                  text_font: mp_icons_m
+                  text_color: ${mp_text}
+
+        - label:
+            x: 88
+            y: 252
+            text: "\U000F057F"
+            text_font: mp_icons_m
+            text_color: ${mp_text_dim}
+
+        - slider:
+            id: mp_volume_slider
+            x: 128
+            y: 260
+            width: 264
+            height: 16
+            min_value: 0
+            max_value: 100
+            value: 0
+            bg_color: ${mp_card_pressed}
+            bg_opa: COVER
+            indicator:
+              bg_color: ${mp_accent}
+            knob:
+              bg_color: ${mp_text}
+              pad_all: 4
+            on_value:
+              - lvgl.label.update:
+                  id: mp_volume_lbl
+                  text: !lambda 'return str_sprintf("%d%%", (int) lv_slider_get_value(id(mp_volume_slider)));'
+            on_release:
+              - homeassistant.action:
+                  action: media_player.volume_set
+                  data:
+                    entity_id: ${mp_entity}
+                  variables:
+                    vol: !lambda 'return lv_slider_get_value(id(mp_volume_slider)) / 100.0f;'
+                  data_template:
+                    volume_level: "{{ vol }}"
+
+        - label:
+            id: mp_volume_lbl
+            x: 404
+            y: 258
+            width: 60
+            text_align: RIGHT
+            text: "0%"
+            text_font: mp_font_body
+            text_color: ${mp_text}
